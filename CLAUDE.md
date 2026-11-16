@@ -442,9 +442,12 @@ AIエディタは以下の順序で実装を進めてください。
 - [x] 作成対象の範囲を限定し、対象外の依頼を PM が断る機能を追加（1.1）。実際の AI で判断を確認済み
 - [x] エージェント間の相談を追加（6.5 / 7.5）。実際の AI で SE・PG の相談から実装までを API 単体で確認済み
   - 見つかった問題を修正: 回答の番号、SE 工程の決定と矛盾する回答（`priorQa` を追加）、`npm run dev` でのデバッグ用ポートの衝突
-- [ ] ユーザーがローカルで画面から通しで操作して確認
-- [ ] ローカル確認後、`npm run deploy:check` → `npm run deploy` で本番デプロイ（ユーザーの指示を待ってから行う）
-- [ ] デプロイ後、api の `workers.dev` の URL にアクセスできないことを確認
+- [x] ユーザーがローカルで画面から通しで操作して確認
+- [x] 本番デプロイ（2026-11-16、ユーザーが手動で実行）。URL: https://workers-ai-dev-team-web.yoshihicode.workers.dev/
+  - デプロイはユーザー自身が行う。AI は手順の案内と事前検証（`npm run deploy:check`）までとする。
+  - 初回の api デプロイで、Worker の作成・アップロード後に `[10007] This Worker does not exist on your account.` が出て止まった。api は作成・デプロイ済みだったため、再デプロイで解消した（Worker の新規作成直後の反映待ちによるものと推測。cf 1.0.0-beta.32）。
+  - KV `workers-ai-dev-team-api-usage` は `cf deploy` が自動作成した。
+- [x] api の `workers.dev` の URL に外部からアクセスできないことを確認（`error code: 1042`。`subdomain.enabled: false`）
 
 ## 11. 決定事項（2026-11-16 ユーザー確認済み）
 - **公開範囲**: 認証なし（URL を知っている人は誰でも利用できる）。必要になったら Cloudflare Access 等を後から追加する。
