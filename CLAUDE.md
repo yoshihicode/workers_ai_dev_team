@@ -234,6 +234,7 @@ workers_ai_dev_team/            # npm workspaces monorepo
         ├── tsconfig.json       # React（DOM）用
         ├── tsconfig.worker.json# Worker・設定ファイル用（Workers の型）
         ├── index.html
+        ├── public/favicon.svg  # ファビコン（PM・SE・PG の連携を表す3つの丸。ビルドにそのまま含まれる）
         ├── worker/index.ts     # /api/* を api Worker に転送
         ├── src/                # React SPA
         │   ├── main.tsx
