@@ -1,0 +1,28 @@
+{
+	"name": "@workers-ai-dev-team/web",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"dev": "cf dev",
+		"build": "cf build",
+		"deploy:check": "cf deploy --dry-run",
+		"deploy": "cf deploy",
+		"typecheck": "cf workers types && tsc -p tsconfig.json && tsc -p tsconfig.worker.json",
+		"test": "vitest run"
+	},
+	"dependencies": {
+		"react": "^19.3.1",
+		"react-dom": "^19.3.1"
+	},
+	"devDependencies": {
+		"@cloudflare/vite-plugin": "^2.0.0-beta.v.17",
+		"@types/react": "^19.3.0",
+		"@types/react-dom": "^19.3.0",
+		"@vitejs/plugin-react": "^6.3.0",
+		"@workers-ai-dev-team/api": "*",
+		"cf": "^1.0.0-beta.32",
+		"typescript": "^7.0.2",
+		"vite": "^8.3.8",
+		"vitest": "^5.1.0"
+	}
+}
