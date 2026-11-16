@@ -1,14 +1,17 @@
 import { useEffect, useRef } from "react";
 import { downloadMarkdown } from "../lib/download.ts";
 
-export type ArtifactKey = "requirements" | "consultation" | "design" | "code";
+export type ArtifactKey = "requirements" | "consultation" | "design" | "code" | "review" | "codeBefore";
 export type Artifacts = Record<ArtifactKey, string>;
 
-const TABS: { key: ArtifactKey; label: string; filename: string }[] = [
+const TABS: { key: ArtifactKey; label: string; filename: string; hideWhenEmpty?: boolean }[] = [
 	{ key: "requirements", label: "要件定義書", filename: "requirements.md" },
 	{ key: "consultation", label: "相談記録", filename: "consultation.md" },
 	{ key: "design", label: "設計書", filename: "design.md" },
 	{ key: "code", label: "ソースコード", filename: "source-code.md" },
+	{ key: "review", label: "レビュー記録", filename: "review.md" },
+	// レビューで作り直したときだけ表示する
+	{ key: "codeBefore", label: "修正前のコード", filename: "source-code-before-review.md", hideWhenEmpty: true },
 ];
 
 interface Props {
@@ -22,9 +25,12 @@ interface Props {
 
 export function ArtifactTabs({ artifacts, active, live, allDone, onSelect }: Props) {
 	const previewRef = useRef<HTMLPreElement>(null);
+	const tabs = TABS.filter((tab) => !tab.hideWhenEmpty || artifacts[tab.key] || tab.key === active);
 	const content = artifacts[active];
 	const current = TABS.find((tab) => tab.key === active) ?? TABS[0]!;
 	const activeIsLive = live.includes(active);
+	// 文字が打ち込まれる表示（キャレット）はストリーミングする成果物だけ
+	const showCaret = activeIsLive && (active === "design" || active === "code");
 
 	// 作成中は末尾に追従する
 	useEffect(() => {
@@ -36,7 +42,7 @@ export function ArtifactTabs({ artifacts, active, live, allDone, onSelect }: Pro
 	return (
 		<section className="panel artifacts" aria-label="成果物">
 			<div className="tabs" role="tablist">
-				{TABS.map((tab) => (
+				{tabs.map((tab) => (
 					<button
 						key={tab.key}
 						type="button"
@@ -54,7 +60,7 @@ export function ArtifactTabs({ artifacts, active, live, allDone, onSelect }: Pro
 
 			<pre ref={previewRef} className="preview" role="tabpanel">
 				{content || <span className="preview__empty">まだ作成されていません。</span>}
-				{activeIsLive && active !== "consultation" && <span className="caret" aria-hidden="true" />}
+				{showCaret && <span className="caret" aria-hidden="true" />}
 			</pre>
 
 			<div className="artifacts__actions">

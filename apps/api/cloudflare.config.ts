@@ -11,10 +11,10 @@ export const apiWorker = defineWorker({
 	env: {
 		// Workers AI はローカルで再現できないため、開発中もリモート（Cloudflare 上）で実行する
 		AI: bindings.ai({ dev: { remote: true } }),
-		// 1日の AI 呼び出し回数カウント用（ローカル開発ではローカルの KV を使う）
+		// 1日の Neurons 消費量の記録用（ローカル開発ではローカルの KV を使う）
 		USAGE: bindings.kv(),
-		// 1日の AI 呼び出し回数の上限（CLAUDE.md 7.4）。無料枠 10,000 Neurons の約5割（平均 115 Neurons/回 × 43 ≒ 4,950）
-		DAILY_AI_CALL_LIMIT: bindings.text("43"),
+		// 1日の Neurons 消費量の上限（CLAUDE.md 7.4）。無料枠 10,000 Neurons/日の5割
+		DAILY_NEURON_LIMIT: bindings.text("5000"),
 	},
 });
 

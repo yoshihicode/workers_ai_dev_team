@@ -45,6 +45,47 @@ export interface AgentWorkRequest {
 	input: string;
 	/** 着手前の相談で得た回答（任意） */
 	qa?: QaItem[];
+	/** レビューの指摘を反映して作り直す場合（PG のみ） */
+	review?: ReviewFix;
+}
+
+/**
+ * レビュー（CLAUDE.md 6.6）
+ * PG のソースコードを SE（設計との整合）と PM（要件との整合）がレビューし、指摘があれば PG が1回作り直す。
+ */
+export type ReviewerRole = "SE" | "PM";
+export type ReviewVerdict = "approved" | "changes_requested";
+
+export interface ReviewComment {
+	reviewer: ReviewerRole;
+	comment: string;
+}
+
+export interface ReviewFix {
+	/** 修正前のソースコード */
+	previousCode: string;
+	/** 反映する指摘 */
+	comments: ReviewComment[];
+}
+
+/** POST /api/agent/review */
+export interface AgentReviewRequest {
+	role: ReviewerRole;
+	/** レビュー対象のソースコード（PG の出力全体） */
+	code: string;
+	requirements: string;
+	/** 設計書（SE のレビューで必須） */
+	design?: string;
+	/** ヒアリング記録（PM のレビューで使う） */
+	messages?: ChatMessage[];
+	/** 着手前の相談で決まった事項 */
+	qa?: QaItem[];
+}
+
+export interface AgentReviewResponse {
+	verdict: ReviewVerdict;
+	/** 0〜5件。approved のときは空 */
+	comments: string[];
 }
 
 /**

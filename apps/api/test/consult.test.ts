@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { buildAnswerInput, buildConsultInput, buildWorkInput, callJsonWithRetry } from "../src/ai.ts";
+import { buildAnswerInput, buildConsultInput, buildReviewInput, buildWorkInput, callJsonWithRetry } from "../src/ai.ts";
 import {
 	NO_ANSWER,
 	normalizeAnswer,
 	parseAnswerOutput,
 	parseConsultOutput,
+	parseReviewOutput,
+	validateAgentReviewRequest,
 	validateAgentAnswerRequest,
 	validateAgentConsultRequest,
 	validateAgentWorkRequest,
@@ -150,15 +152,17 @@ describe("callJsonWithRetry", () => {
 		let calls = 0;
 		const result = await callJsonWithRetry(
 			"test",
-			async () => (++calls === 1 ? "broken" : { ok: 1 }),
+			async () => ({ response: ++calls === 1 ? "broken" : { ok: 1 }, neurons: 10 }),
 			(r) => (typeof r === "object" ? r : null),
 		);
 		expect(calls).toBe(2);
 		expect(result.ok).toBe(true);
+		// 再試行分も含めた Neurons を返す
+		expect(result.neurons).toBe(20);
 	});
 
 	it("2回とも不正なら AI_INVALID_OUTPUT", async () => {
-		const result = await callJsonWithRetry("test", async () => "broken", () => null);
+		const result = await callJsonWithRetry("test", async () => ({ response: "broken", neurons: 5 }), () => null);
 		expect(result).toMatchObject({ ok: false, error: { code: "AI_INVALID_OUTPUT" } });
 	});
 
@@ -214,5 +218,90 @@ describe("priorQa（SE 工程の相談結果）", () => {
 		const answerInput = buildAnswerInput({ role: "SE", from: "PG", questions: ["Q"], requirements: "# 要件", design: "# 設計", priorQa: prior });
 		expect(answerInput).toContain("これまでの相談で決まった事項");
 		expect(answerInput).toContain("事前定義のリストから選ぶ");
+	});
+});
+
+describe("validateAgentReviewRequest", () => {
+	const base = { role: "SE", code: "```ts\nconst a = 1;\n```", requirements: "# 要件", design: "# 設計" };
+
+	it("SE（設計書付き）と PM（ヒアリング記録付き）を受け付ける", () => {
+		expect(validateAgentReviewRequest(base).ok).toBe(true);
+		expect(
+			validateAgentReviewRequest({ role: "PM", code: "x", requirements: "# 要件", messages: [{ role: "user", content: "家計簿" }] }).ok,
+		).toBe(true);
+	});
+
+	it.each([
+		["role 不正", { ...base, role: "PG" }],
+		["code なし", { ...base, code: "" }],
+		["SE なのに設計書なし", { ...base, design: undefined }],
+		["要件定義書なし", { ...base, requirements: " " }],
+	])("%s は INVALID_REQUEST", (_, body) => {
+		expect(validateAgentReviewRequest(body)).toMatchObject({ code: "INVALID_REQUEST" });
+	});
+});
+
+describe("parseReviewOutput", () => {
+	it("指摘があれば changes_requested（番号は取り除き、最大5件）", () => {
+		const comments = ["1. 削除機能がない", "2. 合計の計算が誤り", "c", "d", "e", "f"];
+		const result = parseReviewOutput({ verdict: "changes_requested", comments });
+		expect(result?.verdict).toBe("changes_requested");
+		expect(result?.comments).toHaveLength(5);
+		expect(result?.comments[0]).toBe("削除機能がない");
+	});
+
+	it("approved のときは感想が添えられていても指摘なしにする", () => {
+		expect(parseReviewOutput({ verdict: "approved", comments: ["よくできています"] })).toEqual({
+			verdict: "approved",
+			comments: [],
+		});
+	});
+
+	it("changes_requested でも指摘がなければ approved", () => {
+		expect(parseReviewOutput({ verdict: "changes_requested", comments: [] })).toEqual({ verdict: "approved", comments: [] });
+	});
+
+	it("形式が不正なら null", () => {
+		expect(parseReviewOutput({ verdict: "ok", comments: [] })).toBeNull();
+		expect(parseReviewOutput({ verdict: "approved" })).toBeNull();
+	});
+});
+
+describe("validateAgentWorkRequest（review 付き）", () => {
+	const review = { previousCode: "old code", comments: [{ reviewer: "SE", comment: "削除機能を追加" }] };
+
+	it("PG の作り直しを受け付ける", () => {
+		expect(validateAgentWorkRequest({ role: "PG", input: "# 設計", review })).toMatchObject({ ok: true, value: { review } });
+	});
+
+	it("SE には指定できない・形式が不正なら INVALID_REQUEST", () => {
+		expect(validateAgentWorkRequest({ role: "SE", input: "# 要件", review })).toMatchObject({ code: "INVALID_REQUEST" });
+		expect(
+			validateAgentWorkRequest({ role: "PG", input: "# 設計", review: { previousCode: "x", comments: [] } }),
+		).toMatchObject({ code: "INVALID_REQUEST" });
+	});
+});
+
+describe("buildWorkInput（作り直し）/ buildReviewInput", () => {
+	it("修正前のコードと指摘を付ける", () => {
+		const text = buildWorkInput("# 設計", undefined, {
+			previousCode: "const a = 1;",
+			comments: [{ reviewer: "PM", comment: "削除機能を追加" }],
+		});
+		expect(text).toContain("修正前のソースコード");
+		expect(text).toContain("const a = 1;");
+		expect(text).toContain("[PM] 削除機能を追加");
+		expect(text).toContain("すべてのファイルを省略せずに");
+	});
+
+	it("SE のレビューには設計書、PM のレビューにはヒアリング記録を含める", () => {
+		const common = { code: "CODE", requirements: "# 要件", design: "# 設計", messages: [{ role: "user" as const, content: "家計簿" }] };
+		const se = buildReviewInput({ role: "SE", ...common });
+		const pm = buildReviewInput({ role: "PM", ...common });
+		expect(se).toContain("# 設計");
+		expect(se).not.toContain("ヒアリング記録");
+		expect(pm).toContain("ヒアリング記録");
+		expect(pm).not.toContain("# 設計書");
+		expect(pm).toContain("CODE");
 	});
 });

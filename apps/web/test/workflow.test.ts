@@ -1,7 +1,16 @@
 import { describe, expect, it } from "vitest";
 import { actorViews, type WorkflowSnapshot } from "../src/lib/workflow.ts";
 
-const base: WorkflowSnapshot = { phase: "hearing", pmBusy: false, failedAt: null, rejected: false, step: null, answering: [] };
+const base: WorkflowSnapshot = {
+	phase: "hearing",
+	pmBusy: false,
+	failed: false,
+	rejected: false,
+	step: null,
+	answering: [],
+	reviewing: [],
+	fixed: false,
+};
 const views = (patch: Partial<WorkflowSnapshot>) => actorViews({ ...base, ...patch });
 const states = (patch: Partial<WorkflowSnapshot>) => views(patch).map((a) => a.state);
 
@@ -26,8 +35,11 @@ describe("actorViews", () => {
 		expect(states({ phase: "done" })).toEqual(["done", "done", "done"]);
 	});
 
-	it("失敗した工程はエラー表示", () => {
-		expect(states({ phase: "implementing", failedAt: "PG" })).toEqual(["done", "done", "error"]);
+	it("失敗した工程の担当がエラー表示になる", () => {
+		expect(states({ phase: "hearing", failed: true })).toEqual(["error", "idle", "idle"]);
+		expect(states({ phase: "implementing", failed: true })).toEqual(["done", "done", "error"]);
+		expect(states({ phase: "reviewing", failed: true })).toEqual(["error", "error", "done"]);
+		expect(states({ phase: "fixing", failed: true })).toEqual(["done", "done", "error"]);
 	});
 });
 
@@ -50,9 +62,24 @@ describe("actorViews（相談）", () => {
 		expect(pm?.detail).toContain("PG からの質問");
 		expect(se?.detail).toContain("PG からの質問");
 	});
+});
 
-	it("PG の質問が SE 宛てだけなら PM は完了表示のまま", () => {
-		expect(states({ phase: "implementing", step: "answer", answering: ["SE"] })).toEqual(["done", "active", "active"]);
+describe("actorViews（レビュー）", () => {
+	it("レビュー中は SE・PM が稼働中で、PG はレビュー待ち", () => {
+		const [pm, se, pg] = views({ phase: "reviewing", reviewing: ["SE", "PM"] });
+		expect([pm?.state, se?.state, pg?.state]).toEqual(["active", "active", "done"]);
+		expect(se?.detail).toContain("設計どおりか");
+		expect(pm?.detail).toContain("要件を満たしているか");
+		expect(pg?.detail).toContain("レビュー待ち");
+	});
+
+	it("片方のレビューが終わったら、そのアクターは完了表示に戻る", () => {
+		expect(states({ phase: "reviewing", reviewing: ["PM"] })).toEqual(["active", "done", "done"]);
+	});
+
+	it("作り直し中は PG が稼働中、完了後は作り直したことが分かる", () => {
+		expect(states({ phase: "fixing" })).toEqual(["done", "done", "active"]);
+		expect(views({ phase: "done", fixed: true }).at(2)?.detail).toContain("作り直しました");
 	});
 });
 

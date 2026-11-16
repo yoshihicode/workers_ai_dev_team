@@ -4,6 +4,7 @@ import { handleAgentWork } from "./agent.ts";
 import { handleAgentAnswer, handleAgentConsult } from "./consult.ts";
 import { errorResponse } from "./errors.ts";
 import { handlePmChat } from "./pm.ts";
+import { handleAgentReview } from "./review.ts";
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -16,9 +17,10 @@ async function readJson(req: Request): Promise<unknown> {
 }
 
 app.post("/api/pm/chat", async (c) => handlePmChat(await readJson(c.req.raw), c.env));
-app.post("/api/agent/work", async (c) => handleAgentWork(await readJson(c.req.raw), c.env));
+app.post("/api/agent/work", async (c) => handleAgentWork(await readJson(c.req.raw), c.env, c.executionCtx));
 app.post("/api/agent/consult", async (c) => handleAgentConsult(await readJson(c.req.raw), c.env));
 app.post("/api/agent/answer", async (c) => handleAgentAnswer(await readJson(c.req.raw), c.env));
+app.post("/api/agent/review", async (c) => handleAgentReview(await readJson(c.req.raw), c.env));
 
 app.notFound(() => errorResponse(404, "INVALID_REQUEST", "Not Found"));
 app.onError((error) => {

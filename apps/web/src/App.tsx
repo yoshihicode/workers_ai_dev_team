@@ -1,17 +1,47 @@
 import { useMemo, useRef, useState } from "react";
-import type { AgentRole, ChatMessage, ConsultTarget, QaItem } from "@workers-ai-dev-team/api/types";
+import type {
+	AgentRole,
+	ChatMessage,
+	ConsultTarget,
+	QaItem,
+	ReviewComment,
+	ReviewerRole,
+} from "@workers-ai-dev-team/api/types";
 import { ArtifactTabs, type ArtifactKey, type Artifacts } from "./components/ArtifactTabs.tsx";
 import { ChatPanel } from "./components/ChatPanel.tsx";
 import { StatusBoard } from "./components/StatusBoard.tsx";
 import { ApiError, postPmChat, streamAgentWork } from "./lib/api.ts";
 import { consultationMarkdown, type ConsultationRound } from "./lib/consultation.ts";
 import { runConsultation } from "./lib/pipeline.ts";
+import { reviewMarkdown, runReviews, type FixStatus, type ReviewResult } from "./lib/review.ts";
 import { actorViews, type ActorId, type Phase, type Step } from "./lib/workflow.ts";
 
-/** AI が作る成果物（相談記録は rounds から組み立てる） */
-type Documents = Omit<Artifacts, "consultation">;
+/** AI が作る成果物（相談記録・レビュー記録は別の状態から組み立てる） */
+type Documents = Pick<Artifacts, "requirements" | "design" | "code" | "codeBefore">;
 
-const EMPTY_DOCUMENTS: Documents = { requirements: "", design: "", code: "" };
+const EMPTY_DOCUMENTS: Documents = { requirements: "", design: "", code: "", codeBefore: "" };
+
+/** 途中から再開できる段階（SE → PG → レビュー → 作り直し） */
+type Stage = "SE" | "PG" | "REVIEW" | "FIX";
+const STAGES: Stage[] = ["SE", "PG", "REVIEW", "FIX"];
+
+/** エラーで止まったときに再開する段階と、ボタンの文言 */
+const RESUME: Partial<Record<Phase, { stage: Stage; label: string }>> = {
+	designing: { stage: "SE", label: "SE（設計）から再試行" },
+	implementing: { stage: "PG", label: "PG（実装）から再試行" },
+	reviewing: { stage: "REVIEW", label: "レビューから再試行" },
+	fixing: { stage: "FIX", label: "作り直しから再試行" },
+};
+
+interface PipelineContext {
+	requirements: string;
+	history: ChatMessage[];
+	design?: string;
+	/** レビュー対象（作り直し前）のソースコード */
+	code?: string;
+	/** 作り直しで反映する指摘 */
+	comments?: ReviewComment[];
+}
 
 function errorMessage(error: unknown): string {
 	if (error instanceof ApiError) return error.message;
@@ -34,9 +64,12 @@ export function App() {
 	const [pmBusy, setPmBusy] = useState(false);
 	const [documents, setDocuments] = useState<Documents>(EMPTY_DOCUMENTS);
 	const [rounds, setRounds] = useState<ConsultationRound[]>([]);
+	const [reviews, setReviews] = useState<ReviewResult[]>([]);
+	const [fix, setFix] = useState<FixStatus>(null);
+	const [reviewComments, setReviewComments] = useState<ReviewComment[]>([]);
 	const [activeTab, setActiveTab] = useState<ArtifactKey>("requirements");
 	const [streaming, setStreaming] = useState<ArtifactKey | null>(null);
-	const [failedAt, setFailedAt] = useState<ActorId | null>(null);
+	const [failed, setFailed] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 	const [rejected, setRejected] = useState(false);
 	const abortRef = useRef<AbortController | null>(null);
@@ -53,19 +86,32 @@ export function App() {
 				: "work";
 	const answering: ConsultTarget[] =
 		currentRound?.status === "answering" ? [...new Set(currentRound.entries.map((e) => e.to))] : [];
-	const consultationLive = step === "consult" || step === "answer";
+	const reviewing: ReviewerRole[] =
+		phase === "reviewing" ? reviews.filter((r) => r.status === "reviewing").map((r) => r.reviewer) : [];
 
-	const actors = actorViews({ phase, pmBusy, failedAt, rejected, step: failedAt ? null : step, answering });
+	const actors = actorViews({
+		phase,
+		pmBusy,
+		failed,
+		rejected,
+		step: failed ? null : step,
+		answering: failed ? [] : (answering as ActorId[]),
+		reviewing: failed ? [] : reviewing,
+		fixed: fix === "done",
+	});
 
 	const artifacts: Artifacts = useMemo(
-		() => ({ ...documents, consultation: consultationMarkdown(rounds) }),
-		[documents, rounds],
+		() => ({ ...documents, consultation: consultationMarkdown(rounds), review: reviewMarkdown(reviews, fix) }),
+		[documents, rounds, reviews, fix],
 	);
 
-	const live: ArtifactKey[] = [
-		...(streaming ? [streaming] : []),
-		...(consultationLive && !failedAt ? (["consultation"] as const) : []),
-	];
+	const live: ArtifactKey[] = failed
+		? []
+		: [
+				...(streaming ? [streaming] : []),
+				...(step === "consult" || step === "answer" ? (["consultation"] as const) : []),
+				...(phase === "reviewing" ? (["review"] as const) : []),
+			];
 
 	const newSignal = () => {
 		abortRef.current?.abort();
@@ -76,71 +122,101 @@ export function App() {
 	const upsertRound = (round: ConsultationRound) =>
 		setRounds((prev) => [...prev.filter((r) => r.from !== round.from), round]);
 
+	const upsertReview = (result: ReviewResult) =>
+		setReviews((prev) => [...prev.filter((r) => r.reviewer !== result.reviewer), result]);
+
 	/**
-	 * SE → PG を順に実行する（from で途中から再開できる）。
-	 * 各工程の前に相談（質問 → 回答）を行い、回答を作業の入力に付ける。
+	 * SE → PG → レビュー → 作り直し を順に実行する（from で途中から再開できる）。
+	 * SE / PG は作業の前に相談し、レビューで指摘があれば PG が1回だけ作り直す。
 	 */
-	const runPipeline = async (
-		requirements: string,
-		from: AgentRole,
-		history: ChatMessage[],
-		existingDesign = "",
-	) => {
+	const runPipeline = async (from: Stage, ctx: PipelineContext) => {
 		const signal = newSignal();
 		setError(null);
-		setFailedAt(null);
-		let design = existingDesign;
-		// SE 工程の相談結果（PG から再開する場合は記録から復元する）
+		setFailed(false);
+		const start = STAGES.indexOf(from);
+		const { requirements, history } = ctx;
+		let design = ctx.design ?? "";
+		let code = ctx.code ?? "";
+		let comments = ctx.comments ?? [];
 		let seQa = qaFromRound(rounds.find((r) => r.from === "SE"));
-		let failedStep: ActorId = from;
+		let pgQa = qaFromRound(rounds.find((r) => r.from === "PG"));
+		const appendTo = (key: "design" | "code") => (text: string) =>
+			setDocuments((prev) => ({ ...prev, [key]: prev[key] + text }));
+
 		try {
-			if (from === "SE") {
+			if (start <= STAGES.indexOf("SE")) {
 				setPhase("designing");
 				setRounds([]);
-				setDocuments((prev) => ({ ...prev, design: "", code: "" }));
+				setDocuments((prev) => ({ ...prev, design: "", code: "", codeBefore: "" }));
 				setActiveTab("consultation");
 				seQa = await runConsultation({ role: "SE", input: requirements, requirements, messages: history, signal, onRound: upsertRound });
-				const qa = seQa;
 				setActiveTab("design");
 				setStreaming("design");
-				design = await streamAgentWork(
-					"SE",
-					requirements,
-					qa,
-					(text) => setDocuments((prev) => ({ ...prev, design: prev.design + text })),
-					signal,
-				);
+				design = await streamAgentWork("SE", requirements, appendTo("design"), { qa: seQa, signal });
 				setStreaming(null);
 			}
-			failedStep = "PG";
-			setPhase("implementing");
-			setRounds((prev) => prev.filter((r) => r.from !== "PG"));
-			setDocuments((prev) => ({ ...prev, code: "" }));
-			setActiveTab("consultation");
-			const pgQa = await runConsultation({
-				role: "PG",
-				input: design,
-				requirements,
-				design,
-				messages: history,
-				priorQa: seQa,
-				signal,
-				onRound: upsertRound,
-			});
+
+			if (start <= STAGES.indexOf("PG")) {
+				setPhase("implementing");
+				setRounds((prev) => prev.filter((r) => r.from !== "PG"));
+				setDocuments((prev) => ({ ...prev, code: "", codeBefore: "" }));
+				setActiveTab("consultation");
+				pgQa = await runConsultation({
+					role: "PG",
+					input: design,
+					requirements,
+					design,
+					messages: history,
+					priorQa: seQa,
+					signal,
+					onRound: upsertRound,
+				});
+				setActiveTab("code");
+				setStreaming("code");
+				// PG には SE 工程と PG 工程の両方の確認事項を渡す
+				code = await streamAgentWork("PG", design, appendTo("code"), { qa: [...seQa, ...pgQa], signal });
+				setStreaming(null);
+			}
+
+			if (start <= STAGES.indexOf("REVIEW")) {
+				setPhase("reviewing");
+				setReviews([]);
+				setFix(null);
+				setDocuments((prev) => ({ ...prev, codeBefore: "" }));
+				setActiveTab("review");
+				comments = await runReviews({
+					code,
+					requirements,
+					design,
+					messages: history,
+					qa: [...seQa, ...pgQa],
+					signal,
+					onResult: upsertReview,
+				});
+				setReviewComments(comments);
+				if (comments.length === 0) {
+					setFix("none");
+					setPhase("done");
+					return;
+				}
+			}
+
+			// 作り直し（1回だけ）。修正前のコードは比較できるよう残す
+			setPhase("fixing");
+			setFix("fixing");
+			setDocuments((prev) => ({ ...prev, codeBefore: code, code: "" }));
 			setActiveTab("code");
 			setStreaming("code");
-			// PG には SE 工程と PG 工程の両方の確認事項を渡す
-			await streamAgentWork(
-				"PG",
-				design,
-				[...seQa, ...pgQa],
-				(text) => setDocuments((prev) => ({ ...prev, code: prev.code + text })),
+			await streamAgentWork("PG", design, appendTo("code"), {
+				qa: [...seQa, ...pgQa],
+				review: { previousCode: code, comments },
 				signal,
-			);
+			});
+			setFix("done");
 			setPhase("done");
 		} catch (e) {
 			if (isAbort(e)) return;
-			setFailedAt(failedStep);
+			setFailed(true);
 			setError(errorMessage(e));
 		} finally {
 			setStreaming(null);
@@ -152,7 +228,7 @@ export function App() {
 		setMessages(next);
 		setPmBusy(true);
 		setError(null);
-		setFailedAt(null);
+		setFailed(false);
 		setRejected(false);
 		try {
 			const result = await postPmChat(next, newSignal());
@@ -162,27 +238,38 @@ export function App() {
 			setRejected(result.status === "rejected");
 			if (result.status === "completed" && result.requirements) {
 				setDocuments({ ...EMPTY_DOCUMENTS, requirements: result.requirements });
+				setReviews([]);
+				setFix(null);
 				setPmBusy(false);
-				void runPipeline(result.requirements, "SE", history);
+				void runPipeline("SE", { requirements: result.requirements, history });
 				return;
 			}
 		} catch (e) {
 			if (isAbort(e)) return;
 			// 送信に失敗したメッセージは入力し直せるよう履歴から外す
 			setMessages(messages);
-			setFailedAt("PM");
+			setFailed(true);
 			setError(errorMessage(e));
 		}
 		setPmBusy(false);
 	};
 
+	const resume = RESUME[phase];
+
 	const retry = () => {
-		if (failedAt === "SE") void runPipeline(documents.requirements, "SE", messages);
-		else if (failedAt === "PG") void runPipeline(documents.requirements, "PG", messages, documents.design);
-		else {
+		if (!resume) {
 			setError(null);
-			setFailedAt(null);
+			setFailed(false);
+			return;
 		}
+		void runPipeline(resume.stage, {
+			requirements: documents.requirements,
+			history: messages,
+			design: documents.design,
+			// 作り直しの再試行では、修正前（レビュー対象）のコードを使う
+			code: resume.stage === "FIX" ? documents.codeBefore : documents.code,
+			comments: reviewComments,
+		});
 	};
 
 	const reset = () => {
@@ -192,9 +279,12 @@ export function App() {
 		setPmBusy(false);
 		setDocuments(EMPTY_DOCUMENTS);
 		setRounds([]);
+		setReviews([]);
+		setFix(null);
+		setReviewComments([]);
 		setActiveTab("requirements");
 		setStreaming(null);
-		setFailedAt(null);
+		setFailed(false);
 		setError(null);
 		setRejected(false);
 	};
@@ -205,7 +295,7 @@ export function App() {
 				<div>
 					<h1 className="app__title">AI開発チーム</h1>
 					<p className="app__lead">
-						PM・SE・PG の AI が相談しながら、要件定義書・設計書・ソースコードを順番に作成します。
+						PM・SE・PG の AI が相談・レビューしながら、要件定義書・設計書・ソースコードを順番に作成します。
 					</p>
 				</div>
 				<button type="button" className="button" onClick={reset}>
@@ -218,16 +308,9 @@ export function App() {
 			{error && (
 				<div className="alert" role="alert">
 					<p>{error}</p>
-					{(failedAt === "SE" || failedAt === "PG") && (
-						<button type="button" className="button" onClick={retry}>
-							{failedAt} から再試行
-						</button>
-					)}
-					{failedAt === "PM" && (
-						<button type="button" className="button" onClick={retry}>
-							閉じる
-						</button>
-					)}
+					<button type="button" className="button" onClick={retry}>
+						{resume ? resume.label : "閉じる"}
+					</button>
 				</div>
 			)}
 

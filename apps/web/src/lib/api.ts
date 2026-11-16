@@ -3,7 +3,10 @@ import type {
 	AgentAnswerResponse,
 	AgentConsultRequest,
 	AgentConsultResponse,
+	AgentReviewRequest,
+	AgentReviewResponse,
 	AgentRole,
+	ReviewFix,
 	AgentWorkRequest,
 	ApiErrorCode,
 	ApiErrorResponse,
@@ -76,6 +79,20 @@ export async function postAnswer(req: AgentAnswerRequest, signal?: AbortSignal):
 	return ((await response.json()) as AgentAnswerResponse).answers;
 }
 
+/** SE / PM が PG のソースコードをレビューする */
+export async function postReview(req: AgentReviewRequest, signal?: AbortSignal): Promise<AgentReviewResponse> {
+	const response = await post("/api/agent/review", req, signal);
+	return (await response.json()) as AgentReviewResponse;
+}
+
+export interface WorkOptions {
+	/** 着手前の相談で得た回答 */
+	qa?: QaItem[];
+	/** レビューの指摘を反映して作り直す場合（PG のみ） */
+	review?: ReviewFix;
+	signal?: AbortSignal;
+}
+
 /**
  * SE / PG の成果物をストリーミングで受け取る。
  * 受け取った断片ごとに onText を呼び、最後に全文を返す。
@@ -83,11 +100,16 @@ export async function postAnswer(req: AgentAnswerRequest, signal?: AbortSignal):
 export async function streamAgentWork(
 	role: AgentRole,
 	input: string,
-	qa: QaItem[],
 	onText: (text: string) => void,
-	signal?: AbortSignal,
+	options: WorkOptions = {},
 ): Promise<string> {
-	const body: AgentWorkRequest = qa.length > 0 ? { role, input, qa } : { role, input };
+	const { qa, review, signal } = options;
+	const body: AgentWorkRequest = {
+		role,
+		input,
+		...(qa && qa.length > 0 ? { qa } : {}),
+		...(review ? { review } : {}),
+	};
 	const response = await post("/api/agent/work", body, signal);
 	if (!response.body) throw new ApiError("AI_ERROR", "ストリームを受信できませんでした。");
 

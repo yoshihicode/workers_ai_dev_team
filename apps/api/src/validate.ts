@@ -9,7 +9,8 @@ import type {
 	PmChatResponse,
 	QaItem,
 } from "./types.ts";
-import { MAX_QUESTIONS } from "./ai.ts";
+import { MAX_QUESTIONS, MAX_REVIEW_COMMENTS } from "./ai.ts";
+import type { AgentReviewRequest, AgentReviewResponse, ReviewComment, ReviewFix } from "./types.ts";
 
 /** 作業リクエストに付けられる回答の最大数（PG は SE と PM の両方から最大3件ずつ受け取りうる） */
 const MAX_QA_ITEMS = MAX_QUESTIONS * 2;
@@ -85,20 +86,117 @@ function validateRoleAndInput(
 	return { ok: true, value: { role: body.role, input: body.input, body } };
 }
 
+/** レビューの指摘（PG の作り直し用）を2人分まで受け付ける */
+const MAX_FIX_COMMENTS = MAX_REVIEW_COMMENTS * 2;
+
+function isReviewComment(value: unknown): value is ReviewComment {
+	return isRecord(value) && (value.reviewer === "SE" || value.reviewer === "PM") && isNonEmptyString(value.comment);
+}
+
+function isReviewFix(value: unknown): value is ReviewFix {
+	return (
+		isRecord(value) &&
+		isNonEmptyString(value.previousCode) &&
+		Array.isArray(value.comments) &&
+		value.comments.length > 0 &&
+		value.comments.length <= MAX_FIX_COMMENTS &&
+		value.comments.every(isReviewComment)
+	);
+}
+
 export function validateAgentWorkRequest(body: unknown): ValidationResult<AgentWorkRequest> {
 	const base = validateRoleAndInput(body);
 	if (!base.ok) return base;
 	const { role, input } = base.value;
-	const qa = base.value.body.qa;
-	if (qa === undefined) return { ok: true, value: { role, input } };
-	if (!Array.isArray(qa) || qa.length > MAX_QA_ITEMS || !qa.every(isQaItem)) {
+	const { qa, review } = base.value.body;
+	if (qa !== undefined && (!Array.isArray(qa) || qa.length > MAX_QA_ITEMS || !qa.every(isQaItem))) {
 		return { ok: false, code: "INVALID_REQUEST", message: "qa は { question, answer } の配列で指定してください。" };
 	}
-	const qaChars = qa.reduce((sum, item) => sum + item.question.length + item.answer.length, 0);
-	if (input.length + qaChars > MAX_INPUT_CHARS) {
+	if (review !== undefined && (role !== "PG" || !isReviewFix(review))) {
+		return {
+			ok: false,
+			code: "INVALID_REQUEST",
+			message: "review は PG のみ指定でき、{ previousCode, comments: { reviewer, comment }[] } で指定してください。",
+		};
+	}
+	// 作り直しでは修正前のコードも入力に含めるため、上限を2倍まで許容する（Qwen のコンテキスト長は 32,768 トークン）
+	const qaChars = (qa ?? []).reduce((sum, item) => sum + item.question.length + item.answer.length, 0);
+	const reviewChars = review
+		? review.previousCode.length + review.comments.reduce((sum, c) => sum + c.comment.length, 0)
+		: 0;
+	const limit = review ? MAX_INPUT_CHARS * 2 : MAX_INPUT_CHARS;
+	if (input.length + qaChars + reviewChars > limit) {
 		return { ok: false, code: "INPUT_TOO_LONG", message: "前工程の成果物が長すぎます。" };
 	}
-	return { ok: true, value: { role, input, qa } };
+	return {
+		ok: true,
+		value: { role, input, ...(qa !== undefined ? { qa } : {}), ...(review !== undefined ? { review } : {}) },
+	};
+}
+
+export function validateAgentReviewRequest(body: unknown): ValidationResult<AgentReviewRequest> {
+	if (!isRecord(body) || (body.role !== "SE" && body.role !== "PM")) {
+		return { ok: false, code: "INVALID_REQUEST", message: "role は \"SE\" または \"PM\" で指定してください。" };
+	}
+	const { role, code, requirements, design, messages, qa } = body;
+	if (!isNonEmptyString(code)) {
+		return { ok: false, code: "INVALID_REQUEST", message: "code（レビュー対象のソースコード）を指定してください。" };
+	}
+	if (!isNonEmptyString(requirements)) {
+		return { ok: false, code: "INVALID_REQUEST", message: "requirements（要件定義書）を指定してください。" };
+	}
+	if (design !== undefined && typeof design !== "string") {
+		return { ok: false, code: "INVALID_REQUEST", message: "design は文字列で指定してください。" };
+	}
+	if (role === "SE" && !isNonEmptyString(design)) {
+		return { ok: false, code: "INVALID_REQUEST", message: "SE のレビューには design（設計書）が必要です。" };
+	}
+	if (messages !== undefined && (!Array.isArray(messages) || !messages.every(isChatMessage))) {
+		return { ok: false, code: "INVALID_REQUEST", message: "messages の形式が正しくありません。" };
+	}
+	if (qa !== undefined && (!Array.isArray(qa) || qa.length > MAX_QA_ITEMS || !qa.every(isQaItem))) {
+		return { ok: false, code: "INVALID_REQUEST", message: "qa は { question, answer } の配列で指定してください。" };
+	}
+	// SE は設計書、PM はヒアリング記録を読むため、実際に AI に渡す資料の長さで判定する
+	const totalChars =
+		code.length +
+		requirements.length +
+		(role === "SE" ? (design?.length ?? 0) : (messages ?? []).reduce((sum, m) => sum + m.content.length, 0)) +
+		(qa ?? []).reduce((sum, item) => sum + item.question.length + item.answer.length, 0);
+	if (totalChars > MAX_INPUT_CHARS) {
+		return { ok: false, code: "INPUT_TOO_LONG", message: "レビューする資料が長すぎます。" };
+	}
+	return {
+		ok: true,
+		value: {
+			role,
+			code,
+			requirements,
+			...(design !== undefined ? { design } : {}),
+			...(messages !== undefined ? { messages } : {}),
+			...(qa !== undefined ? { qa } : {}),
+		},
+	};
+}
+
+/**
+ * レビュー結果（JSON Mode の response）を検証する。
+ * - 指摘の番号を取り除き、最大件数で切る。
+ * - changes_requested でも指摘が1件もなければ approved とみなす。
+ * - approved のときは comments を空にする（承認時に添えられた感想で作り直しが起きないようにする）。
+ */
+export function parseReviewOutput(response: unknown): AgentReviewResponse | null {
+	const value = parseJsonResponse(response);
+	if (!isRecord(value) || !Array.isArray(value.comments)) return null;
+	if (value.verdict !== "approved" && value.verdict !== "changes_requested") return null;
+	if (value.verdict === "approved") return { verdict: "approved", comments: [] };
+	const comments = value.comments
+		.filter(isNonEmptyString)
+		.map((c) => normalizeAnswer(c))
+		.filter((c) => c !== "")
+		.slice(0, MAX_REVIEW_COMMENTS);
+	if (comments.length === 0) return { verdict: "approved", comments: [] };
+	return { verdict: "changes_requested", comments };
 }
 
 export function validateAgentConsultRequest(body: unknown): ValidationResult<AgentConsultRequest> {

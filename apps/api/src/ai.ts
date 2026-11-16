@@ -1,14 +1,23 @@
 /**
  * モデル定義・max_tokens・システムプロンプト・Workers AI 呼び出し・エラー判定
  */
-import type { AgentAnswerRequest, AgentRole, ApiErrorCode, ChatMessage, QaItem } from "./types.ts";
+import type {
+	AgentAnswerRequest,
+	AgentReviewRequest,
+	AgentRole,
+	ApiErrorCode,
+	ChatMessage,
+	QaItem,
+	ReviewFix,
+} from "./types.ts";
+import { extractNeurons } from "./usage.ts";
 
 export const MODELS = {
 	PM: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
 	SE: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
 	PG: "@cf/qwen/qwen2.5-coder-32b-instruct",
 	/**
-	 * 相談（質問作成・回答）用。JSON Mode が必要なため Llama を使う。
+	 * 相談（質問作成・回答）とレビュー用。JSON Mode が必要なため Llama を使う。
 	 * Qwen2.5-Coder は JSON Mode 非対応のため、PG の質問作成も Llama に PG 役をさせる。
 	 */
 	CONSULT: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
@@ -16,6 +25,8 @@ export const MODELS = {
 
 /** 1工程あたりの質問の最大数 */
 export const MAX_QUESTIONS = 3;
+/** 1人のレビュアーが出す指摘の最大数 */
+export const MAX_REVIEW_COMMENTS = 5;
 
 /**
  * 生成トークン数の上限（Workers AI の既定値は 256 のため必ず指定する）。
@@ -28,6 +39,7 @@ export const MAX_TOKENS = {
 	PG: 4096,
 	CONSULT: 512,
 	ANSWER: 1024,
+	REVIEW: 1024,
 } as const;
 
 /**
@@ -114,6 +126,32 @@ export const ANSWER_PROMPTS = {
 	].join("\n"),
 } as const;
 
+const COMMON_REVIEW_RULES = [
+	`指摘は重要なものだけを最大${MAX_REVIEW_COMMENTS}件まで、修正すべき内容が分かるように日本語で1件ずつ簡潔に書いてください。`,
+	"各指摘は「【場所】ファイル名や機能 【問題】資料で求められている内容と、実際のコードの内容 【修正】何をどう直すか」の形で具体的に書いてください。",
+	"実際のコードを読んで問題があると確信できる点だけを指摘してください。資料とコードが同じ内容なら指摘しないでください。確信が持てない点は指摘しないでください。",
+	"「〜を確認してください」「〜が正しく動作することを確認してください」のような、修正内容が決まらない確認依頼は書かないでください。問題があると判断した場合だけ、その問題を指摘してください。",
+	"同じ内容の指摘を重複して書かないでください。",
+	"コードの書き方の好み、命名、コメントの有無、コードの整理やリファクタリング、ログ出力の有無、細かなスタイルは指摘しないでください。",
+	"対象は小規模なアプリです。ログイン機能、外部データベース、決済などの対象外の機能を追加する指摘はしないでください。",
+	"修正が必要な指摘がある場合はverdictを'changes_requested'、問題がなければverdictを'approved'としcommentsを空の配列にしてください。",
+	"指摘の先頭に番号は付けないでください。",
+].join("\n");
+
+export const REVIEW_PROMPTS = {
+	SE: [
+		"あなたはこのプロジェクトのSEです。あなたが作成した設計書と照らして、PGが作成したソースコードをレビューしてください。",
+		"確認する観点: 設計書どおりに実装されているか（ファイル構成・データ構造・処理）、設計書にある機能の抜け漏れ、明らかな不具合（構文の誤り、未定義の変数や関数、動かない処理、ファイルの欠落）。",
+		COMMON_REVIEW_RULES,
+	].join("\n"),
+	PM: [
+		"あなたはこのプロジェクトのPMです。ユーザーとのヒアリング記録と要件定義書に照らして、PGが作成したソースコードと実行手順をレビューしてください。",
+		"確認する観点: 要件定義書の機能がすべて実装されているか、ユーザーの意図や仕様と食い違う動きがないか、実行手順でユーザーが動かせるか、要件にない対象外の機能が追加されていないか。",
+		"あなたはPMなので、利用者から見た機能・仕様の観点だけで指摘してください。コードの内部の作り（関数の分け方、重複、エラー処理の書き方など）は指摘しないでください。",
+		COMMON_REVIEW_RULES,
+	].join("\n"),
+} as const;
+
 export const CONSULT_JSON_SCHEMA = {
 	type: "object",
 	properties: {
@@ -140,17 +178,29 @@ export const ANSWER_JSON_SCHEMA = {
 	required: ["answers"],
 } as const;
 
+export const REVIEW_JSON_SCHEMA = {
+	type: "object",
+	properties: {
+		verdict: { type: "string", enum: ["approved", "changes_requested"] },
+		comments: { type: "array", items: { type: "string" } },
+	},
+	required: ["verdict", "comments"],
+} as const;
+
 const ROLE_LABEL = { PM: "PM", SE: "SE", PG: "PG", user: "ユーザー", assistant: "PM" } as const;
+
+function formatHearing(messages: ChatMessage[]): string {
+	return messages.map((m) => `${ROLE_LABEL[m.role]}: ${m.content}`).join("\n\n");
+}
+
+function formatQaList(qa: QaItem[]): string {
+	return qa.map((item) => `- ${item.question}\n  → ${item.answer}`).join("\n");
+}
 
 /** 回答用の資料（ユーザーメッセージ）を組み立てる */
 export function buildAnswerInput(req: AgentAnswerRequest): string {
 	const parts: string[] = [];
-	if (req.role === "PM" && req.messages?.length) {
-		parts.push(
-			"# ヒアリング記録",
-			req.messages.map((m) => `${ROLE_LABEL[m.role]}: ${m.content}`).join("\n\n"),
-		);
-	}
+	if (req.role === "PM" && req.messages?.length) parts.push("# ヒアリング記録", formatHearing(req.messages));
 	parts.push("# 要件定義書", req.requirements);
 	if (req.design) parts.push("# 設計書", req.design);
 	if (req.priorQa?.length) {
@@ -163,8 +213,15 @@ export function buildAnswerInput(req: AgentAnswerRequest): string {
 	return parts.join("\n\n");
 }
 
-function formatQaList(qa: QaItem[]): string {
-	return qa.map((item) => `- ${item.question}\n  → ${item.answer}`).join("\n");
+/** レビュー用の資料を組み立てる（SE は設計書、PM はヒアリング記録を中心に見る） */
+export function buildReviewInput(req: AgentReviewRequest): string {
+	const parts: string[] = [];
+	if (req.role === "PM" && req.messages?.length) parts.push("# ヒアリング記録", formatHearing(req.messages));
+	parts.push("# 要件定義書", req.requirements);
+	if (req.role === "SE" && req.design) parts.push("# 設計書", req.design);
+	if (req.qa?.length) parts.push("# 着手前の相談で決まった事項", formatQaList(req.qa));
+	parts.push("# レビュー対象のソースコードと実行手順", req.code);
+	return parts.join("\n\n");
 }
 
 /** 質問作成用の入力（PG の場合は SE 工程の相談結果も付ける） */
@@ -173,45 +230,78 @@ export function buildConsultInput(input: string, priorQa: QaItem[] | undefined):
 	return `${input}\n\n---\n\n## これまでの相談で決まった事項（これについては質問しないでください）\n${formatQaList(priorQa)}`;
 }
 
-/** 作業用の入力に、相談で得た回答を付け加える */
-export function buildWorkInput(input: string, qa: QaItem[] | undefined): string {
-	if (!qa?.length) return input;
-	const answers = qa.map((item, i) => `### 確認${i + 1}. ${item.question}\n回答: ${item.answer}`).join("\n\n");
-	return `${input}\n\n---\n\n## 着手前の確認事項と回答\n以下の回答も踏まえて作成してください。\n\n${answers}`;
+/**
+ * 作業用の入力に、相談で得た回答を付け加える。
+ * review があれば（PG の修正）、修正前のソースコードとレビューの指摘も付ける。
+ */
+export function buildWorkInput(input: string, qa: QaItem[] | undefined, review?: ReviewFix): string {
+	let text = input;
+	if (qa?.length) {
+		const answers = qa.map((item, i) => `### 確認${i + 1}. ${item.question}\n回答: ${item.answer}`).join("\n\n");
+		text += `\n\n---\n\n## 着手前の確認事項と回答\n以下の回答も踏まえて作成してください。\n\n${answers}`;
+	}
+	if (review) {
+		const comments = review.comments.map((c, i) => `${i + 1}. [${c.reviewer}] ${c.comment}`).join("\n");
+		text +=
+			"\n\n---\n\n## 修正前のソースコード\n" +
+			review.previousCode +
+			"\n\n---\n\n## レビューでの指摘\n" +
+			comments +
+			"\n\n上記の指摘をすべて反映した、修正後のソースコードと実行手順を出力してください。" +
+			"修正していないファイルも含めて、すべてのファイルを省略せずに出力してください。";
+	}
+	return text;
 }
 
-async function runJson(ai: Ai, system: string, user: string, maxTokens: number, schema: object): Promise<unknown> {
-	const result = await ai.run(MODELS.CONSULT, {
-		messages: [
-			{ role: "system", content: system },
-			{ role: "user", content: user },
-		],
+/** JSON Mode の呼び出し結果（Neurons の記録用に消費量も返す） */
+export interface AiJsonResult {
+	response: unknown;
+	neurons: number;
+}
+
+async function runJson(
+	ai: Ai,
+	label: string,
+	model: (typeof MODELS)["PM" | "CONSULT"],
+	messages: { role: "system" | "user" | "assistant"; content: string }[],
+	maxTokens: number,
+	schema: object,
+): Promise<AiJsonResult> {
+	const result = await ai.run(model, {
+		messages,
 		max_tokens: maxTokens,
 		response_format: { type: "json_schema", json_schema: schema },
 	});
 	const { response, usage } = result as { response?: unknown; usage?: unknown };
-	if (usage) console.log("CONSULT usage", JSON.stringify(usage));
-	return response;
+	if (usage) console.log(`${label} usage`, JSON.stringify(usage));
+	return { response, neurons: extractNeurons(usage) ?? 0 };
 }
 
-export function runConsult(ai: Ai, role: AgentRole, input: string, priorQa?: QaItem[]): Promise<unknown> {
-	return runJson(ai, CONSULT_PROMPTS[role], buildConsultInput(input, priorQa), MAX_TOKENS.CONSULT, CONSULT_JSON_SCHEMA);
+function system(content: string) {
+	return { role: "system" as const, content };
 }
 
-export function runAnswer(ai: Ai, req: AgentAnswerRequest): Promise<unknown> {
-	return runJson(ai, ANSWER_PROMPTS[req.role], buildAnswerInput(req), MAX_TOKENS.ANSWER, ANSWER_JSON_SCHEMA);
+function user(content: string) {
+	return { role: "user" as const, content };
 }
 
-export async function runPm(ai: Ai, messages: ChatMessage[]): Promise<unknown> {
-	const result = await ai.run(MODELS.PM, {
-		messages: [{ role: "system", content: SYSTEM_PROMPTS.PM }, ...messages],
-		max_tokens: MAX_TOKENS.PM,
-		response_format: { type: "json_schema", json_schema: PM_JSON_SCHEMA },
-	});
-	const { response, usage } = result as { response?: unknown; usage?: unknown };
-	// Neurons 消費の把握用（SE / PG は SSE の最終イベントに usage が含まれる）
-	if (usage) console.log("PM usage", JSON.stringify(usage));
-	return response;
+export function runPm(ai: Ai, messages: ChatMessage[]): Promise<AiJsonResult> {
+	return runJson(ai, "PM", MODELS.PM, [system(SYSTEM_PROMPTS.PM), ...messages], MAX_TOKENS.PM, PM_JSON_SCHEMA);
+}
+
+export function runConsult(ai: Ai, role: AgentRole, input: string, priorQa?: QaItem[]): Promise<AiJsonResult> {
+	const messages = [system(CONSULT_PROMPTS[role]), user(buildConsultInput(input, priorQa))];
+	return runJson(ai, "CONSULT", MODELS.CONSULT, messages, MAX_TOKENS.CONSULT, CONSULT_JSON_SCHEMA);
+}
+
+export function runAnswer(ai: Ai, req: AgentAnswerRequest): Promise<AiJsonResult> {
+	const messages = [system(ANSWER_PROMPTS[req.role]), user(buildAnswerInput(req))];
+	return runJson(ai, "ANSWER", MODELS.CONSULT, messages, MAX_TOKENS.ANSWER, ANSWER_JSON_SCHEMA);
+}
+
+export function runReview(ai: Ai, req: AgentReviewRequest): Promise<AiJsonResult> {
+	const messages = [system(REVIEW_PROMPTS[req.role]), user(buildReviewInput(req))];
+	return runJson(ai, "REVIEW", MODELS.CONSULT, messages, MAX_TOKENS.REVIEW, REVIEW_JSON_SCHEMA);
 }
 
 /** SE / PG を stream: true で呼び出し、Workers AI の SSE ストリームをそのまま返す */
@@ -220,47 +310,53 @@ export async function runAgentStream(
 	role: AgentRole,
 	input: string,
 	qa?: QaItem[],
-): Promise<ReadableStream> {
+	review?: ReviewFix,
+): Promise<ReadableStream<Uint8Array>> {
 	const result = await ai.run(MODELS[role], {
-		messages: [
-			{ role: "system", content: SYSTEM_PROMPTS[role] },
-			{ role: "user", content: buildWorkInput(input, qa) },
-		],
+		messages: [system(SYSTEM_PROMPTS[role]), user(buildWorkInput(input, qa, review))],
 		max_tokens: MAX_TOKENS[role],
 		stream: true,
 	});
-	return result as ReadableStream;
+	return result as ReadableStream<Uint8Array>;
 }
 
 /** JSON の解釈に失敗したときを含めた試行回数（CLAUDE.md 7.1: 1回だけ再試行） */
 const JSON_MAX_ATTEMPTS = 2;
 
+export type JsonCallResult<T> =
+	| { ok: true; value: T; neurons: number }
+	| { ok: false; error: ClassifiedAiError; neurons: number };
+
 /**
  * JSON Mode の呼び出しを行い、parse で検証する。
  * 解釈できない出力のときは1回だけ再試行し、無料枠超過などの再試行しても解決しないエラーはすぐ返す。
+ * neurons は再試行分も含めた合計。
  */
 export async function callJsonWithRetry<T>(
 	label: string,
-	call: () => Promise<unknown>,
+	call: () => Promise<AiJsonResult>,
 	parse: (response: unknown) => T | null,
-): Promise<{ ok: true; value: T } | { ok: false; error: ClassifiedAiError }> {
+): Promise<JsonCallResult<T>> {
 	let lastError: unknown = null;
+	let neurons = 0;
 	for (let attempt = 0; attempt < JSON_MAX_ATTEMPTS; attempt++) {
 		try {
-			const parsed = parse(await call());
-			if (parsed !== null) return { ok: true, value: parsed };
+			const result = await call();
+			neurons += result.neurons;
+			const parsed = parse(result.response);
+			if (parsed !== null) return { ok: true, value: parsed, neurons };
 			lastError = new Error("JSON Mode couldn't be met");
 		} catch (error) {
 			const classified = classifyAiError(error);
 			if (classified.code !== "AI_INVALID_OUTPUT") {
 				console.error(`${label} call failed`, error);
-				return { ok: false, error: classified };
+				return { ok: false, error: classified, neurons };
 			}
 			lastError = error;
 		}
 	}
 	console.error(`${label} output invalid`, lastError);
-	return { ok: false, error: classifyAiError(lastError) };
+	return { ok: false, error: classifyAiError(lastError), neurons };
 }
 
 export interface ClassifiedAiError {
