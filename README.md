@@ -167,6 +167,29 @@ npm run dev
 
 > `cf` CLI はオープンベータのため、コマンドが変わる可能性があります。最新情報は[公式ドキュメント](https://developers.cloudflare.com/cf/)を確認してください。
 
+## Cloudflare Access の設定（本番環境）
+
+デプロイした web Worker に、One-time PIN（メールで届く PIN）でのログインを設定する手順です。設定はすべて Cloudflare のダッシュボードで行います（2026年11月時点。画面の項目名はダッシュボードの英語表記です）。
+
+1. **Zero Trust を有効にする**（初回のみ）
+   ダッシュボードの **Zero Trust** を開き、案内に従って組織を作成します。無料プラン（Free）は 50 ユーザーまで利用できます。
+2. **One-time PIN を追加する**（初回のみ）
+   **Zero Trust** > **Integrations** > **Identity providers** > **Add new identity provider** > **One-time PIN** を選びます。
+   新しい Zero Trust 組織では One-time PIN が自動では追加されないため、この手順が必要です。
+3. **ログインを許可する人のポリシーを作る**
+   **Zero Trust** > **Access controls** > **Policies** > **Add a policy** で、次のように設定して保存します。
+   - **Action**: Allow
+   - **Rules**（Include）: **Emails** を選び、許可するメールアドレスを入力
+4. **web Worker を保護する**
+   **Workers & Pages** > `workers-ai-dev-team-web` > **Access** タブ > **Protect this Worker behind Access** を選び、**All traffic** と手順3のポリシーを指定して適用します。
+   api Worker は外部に公開していない（`workersDev: false`）ため、保護は不要です。
+5. **動作を確認する**
+   シークレットウィンドウで web の URL を開き、メールアドレスを入力 → 届いた PIN を入力してログインできることを確認します。許可していないメールアドレスではログインできません。
+
+ログインできる人を追加・削除するときは、手順3のポリシーの **Emails** を編集します。
+
+参考: [One-time PIN login](https://developers.cloudflare.com/cloudflare-one/integrations/identity-providers/one-time-pin/) / [Access policies](https://developers.cloudflare.com/cloudflare-one/access-controls/policies/policy-management/) / [Cloudflare Access（Workers）](https://developers.cloudflare.com/workers/configuration/cloudflare-access/)
+
 ## 無料枠についての注意
 
 このアプリは Cloudflare Workers の無料プランで動かすことを前提にしています。主な上限は次のとおりです（2026年11月時点。最新の値は[公式ドキュメント](https://developers.cloudflare.com/workers/platform/limits/)を確認してください）。
