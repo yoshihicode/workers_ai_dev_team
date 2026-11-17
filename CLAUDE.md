@@ -33,6 +33,7 @@
 ```mermaid
 graph TD
     User((ユーザー))
+    Access["Cloudflare Access<br/>One-time PIN"]
 
     subgraph WEB [web Worker - apps/web]
         Front["フロントエンド<br/>Static Assets<br/>React + Vite"]
@@ -49,7 +50,8 @@ graph TD
         AI_PG["Qwen2.5-Coder-32B<br/>PG役"]
     end
 
-    User -->|HTTP / SSE| Front
+    User -->|HTTP / SSE| Access
+    Access -->|許可したメールアドレスのみ| Front
     Front -->|fetch /api/*| Proxy
     Proxy -->|Service Binding| Backend
     Backend -->|AI Binding: JSON Mode| AI_PM
@@ -517,9 +519,17 @@ AIエディタは以下の順序で実装を進めてください。
   - 初回の api デプロイで、Worker の作成・アップロード後に `[10007] This Worker does not exist on your account.` が出て止まった。api は作成・デプロイ済みだったため、再デプロイで解消した（Worker の新規作成直後の反映待ちによるものと推測。cf 1.0.0-beta.32）。
   - KV `workers-ai-dev-team-api-usage` は `cf deploy` が自動作成した。
 - [x] api の `workers.dev` の URL に外部からアクセスできないことを確認（`error code: 1042`。`subdomain.enabled: false`）
+- [x] Cloudflare Access 用のログアウトボタンを追加（11 の「公開範囲」）
+- [x] ユーザーがダッシュボードで Access（One-time PIN・許可メールアドレス）を設定（2026-11-17）
 
 ## 11. 決定事項（2026-11-16 ユーザー確認済み）
-- **公開範囲**: 認証なし（URL を知っている人は誰でも利用できる）。必要になったら Cloudflare Access 等を後から追加する。
+- **公開範囲**（2026-11-17 変更）: Cloudflare Access で web Worker を保護し、**許可したメールアドレスの人だけ**が One-time PIN（メールで届く PIN）でログインできる。
+  - 設定はダッシュボード（Workers & Pages → web Worker → Access）で行い、コードには持たない。
+  - One-time PIN は新しい Zero Trust 組織では自動で追加されないため、Zero Trust → Integrations → Identity providers → Add new identity provider → One-time PIN で追加する（[公式ドキュメント](https://developers.cloudflare.com/cloudflare-one/integrations/identity-providers/one-time-pin/)）。
+  - ログイン用メールアドレスの追加依頼は GitHub Issues で受け付ける（README に記載）。Access は Worker より前で認証するため、web / api のコードでの認証チェックはしない。
+  - Static Assets を持つ Worker では `ctx.access` が Worker に渡されない（公式ドキュメントの制限）ため、使わない。
+  - 画面右上に「ログアウト」（`/cdn-cgi/access/logout`）を置く。ローカル開発（`import.meta.env.PROD` が false）では表示しない。
+  - api は `workersDev: false` のため Access の対象外でよい（外部から直接呼べない）。
 - **利用制限**: 1日の Neurons 消費量を無料枠の5割（5,000）までに制限する（7.4。当初は AI 呼び出し回数で制限していた）。
 - **デプロイ**: ローカルで動作確認してから本番デプロイする。
 - **作成対象**: 小規模なアプリに限定し、対象外は PM がヒアリング段階で断る（1.1）。

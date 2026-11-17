@@ -298,9 +298,17 @@ export function App() {
 						PM・SE・PG の AI が相談・レビューしながら、要件定義書・設計書・ソースコードを順番に作成します。
 					</p>
 				</div>
-				<button type="button" className="button" onClick={reset}>
-					最初からやり直す
-				</button>
+				<div className="app__actions">
+					<button type="button" className="button" onClick={reset}>
+						最初からやり直す
+					</button>
+					{/* Cloudflare Access のログアウト。ローカル開発では Access を通らないため表示しない */}
+					{import.meta.env.PROD && (
+						<a className="button" href="/cdn-cgi/access/logout">
+							ログアウト
+						</a>
+					)}
+				</div>
 			</header>
 
 			<StatusBoard actors={actors} />

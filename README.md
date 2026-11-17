@@ -5,6 +5,10 @@ Cloudflare Workers と Workers AI だけで動作し、**Cloudflare の無料枠
 
 **Live Demo**: https://workers-ai-dev-team-web.yoshihicode.workers.dev/
 
+> **Live Demo の利用にはログインが必要です**
+> Cloudflare Access で保護しており、登録済みのメールアドレスの人だけが利用できます。メールアドレスを入力すると届く PIN（ワンタイムパスワード）を入力してログインします。
+> 利用したい方は、[GitHub Issues](https://github.com/yoshihicode/workers_ai_dev_team/issues) からログイン用のメールアドレスの追加をご依頼ください。
+
 > **このアプリについて**
 > AI エージェントによる開発チームのサンプルです。実用に耐えるかどうかではなく、「AI エージェントで開発チームをどのように実装できるか」を試すための、個人的な実験アプリです。
 > エージェントの役割分担、成果物の受け渡し、エージェント同士の相談、レビューと作り直しといった仕組みを確認することを目的としています。生成される要件定義書・設計書・ソースコードの品質や、そのまま動くことは保証しません。
@@ -56,6 +60,7 @@ PM・SE・PG は、別々の専門家ではありません。ほぼ同じ AI（�
 ```mermaid
 graph TD
     User((ユーザー))
+    Access["Cloudflare Access<br/>One-time PIN でログイン"]
 
     subgraph WEB [web Worker - apps/web]
         Front["フロントエンド<br/>React + Vite"]
@@ -68,12 +73,14 @@ graph TD
 
     WAI["Workers AI"]
 
-    User -->|HTTP / SSE| Front
+    User -->|HTTP / SSE| Access
+    Access -->|登録済みのメールアドレスのみ| Front
     Front --> Proxy
     Proxy -->|Service Binding| Backend
     Backend -->|AI Binding| WAI
 ```
 
+- **Cloudflare Access**: web Worker の手前でログインを求めます。登録済みのメールアドレスに届く PIN でログインした人だけが画面と API を使えます。設定は Cloudflare のダッシュボードで行い、コードには含めていません（ローカル開発ではログインは不要です）。
 - **apps/web**: React の画面を配信し、`/api/*` へのリクエストを api Worker に転送します。
 - **apps/api**: Hono で API を提供し、Workers AI を呼び出します。
 
@@ -98,6 +105,7 @@ workers_ai_dev_team/        # npm workspaces モノレポ
 
 - Cloudflare Workers（Static Assets / Service Binding）
 - Cloudflare Workers AI
+- Cloudflare Access（Zero Trust。One-time PIN によるログイン）
 - Hono
 - React / Vite / TypeScript / プレーンな CSS
 - Vitest（単体テスト）
@@ -144,6 +152,7 @@ npm run dev
 4. ソースコードができると SE と PM がレビューし、「レビュー記録」タブに結果が表示されます。指摘があれば PG が作り直します（さらに2分ほどかかります）。
 5. 各タブのボタンで成果物（要件定義書・相談記録・設計書・ソースコード・レビュー記録・修正前のコード）を Markdown ファイル（`.md`）としてダウンロードできます。すべて完了すると「すべてダウンロード」も使えます。
 6. 途中でエラーになった場合は、エラーが起きた工程（SE / PG / レビュー / 作り直し）から再試行できます。「最初からやり直す」で最初に戻ります。
+7. Live Demo では、画面右上の「ログアウト」でログアウトできます（ローカル開発では表示されません）。
 
 ## コマンド
 

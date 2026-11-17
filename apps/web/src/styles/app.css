@@ -69,6 +69,12 @@ body {
 	gap: 16px;
 }
 
+.app__actions {
+	display: flex;
+	gap: 8px;
+	flex-wrap: wrap;
+}
+
 .app__title {
 	margin: 0;
 	font-size: 1.5rem;
@@ -107,6 +113,8 @@ body {
 	color: var(--text);
 	cursor: pointer;
 	white-space: nowrap;
+	text-decoration: none;
+	display: inline-block;
 }
 
 .button:hover:not(:disabled) {
